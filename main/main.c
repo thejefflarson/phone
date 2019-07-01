@@ -1,6 +1,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <math.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "esp_system.h"
@@ -9,7 +10,6 @@
 #include "esp_spi_flash.h"
 #include "esp_spiffs.h"
 #include "driver/gpio.h"
-#define STB_TRUETYPE_IMPLEMENTATION
 #include "stb_truetype.h"
 
 #define HX8357_TFTWIDTH            320  ///< 320 pixels wide
@@ -47,6 +47,14 @@
 #define HX8357_SETPANEL           0xCC  ///< Set Panel
 #define HX8357_SETGAMMA           0xE0  ///< Set Gamma
 
+#define MADCTL_MY  0x80 ///< Bottom to top
+#define MADCTL_MX  0x40 ///< Right to left
+#define MADCTL_MV  0x20 ///< Reverse Mode
+#define MADCTL_ML  0x10 ///< LCD refresh Bottom to top
+#define MADCTL_RGB 0x00 ///< Red-Green-Blue pixel order
+#define MADCTL_BGR 0x08 ///< Blue-Green-Red pixel order
+#define MADCTL_MH  0x04 ///< LCD refresh right to left
+
 typedef struct {
   uint8_t cmd;
   uint8_t bytes; //No of data in data; bit 7 = delay after set; 0xFF = end of cmds.
@@ -55,11 +63,12 @@ typedef struct {
 
 static const lcd_init_cmd_t init_cmds[] = {
     {HX8357_SWRESET, 0x80, {0}}, // Soft reset, then delay 10 ms
-    {HX8357_SLPOUT, 0x80, {0}}, // Exit Sleep, then delay 50 ms
+    {HX8357_SLPOUT, 0x80, {0}},  // Exit Sleep, then delay 50 ms
+    //{HX8357_MADCTL, 1, {MADCTL_MX | MADCTL_MY | MADCTL_RGB}},
     // TODO: Not sure why this doesn't work
-    /* {HX8357_COLMOD, 1, {0x85}}, // 16 bit */
+    {HX8357_COLMOD, 1, {0x55}}, // 16 bit
     {HX8357_DISPON, 0x80, {0}}, // Main screen turn on, delay 50 ms
-    {0xff, 0, {0}},              // END OF COMMAND LIST
+    {0xff, 0, {0}},             // END OF COMMAND LIST
 };
 
 #define PIN_NUM_MISO 19
@@ -80,7 +89,7 @@ void lcd_cmd(spi_device_handle_t spi, uint8_t cmd) {
   t.length = 8;
   t.tx_buffer = &cmd;
   t.user = (void *)0;
-  ret = spi_device_polling_transmit(spi, &t);
+  ret = spi_device_transmit(spi, &t);
   assert(ret == ESP_OK);
 }
 
@@ -90,7 +99,7 @@ void lcd_data(spi_device_handle_t spi, const uint8_t *data, size_t length) {
   spi_transaction_t t = {0};
   t.length = length * 8; // size in bits
   t.tx_buffer = data;
-  ret = spi_device_polling_transmit(spi, &t);
+  ret = spi_device_transmit(spi, &t);
   assert(ret == ESP_OK);
 }
 
@@ -123,17 +132,84 @@ void lcd_init(spi_device_handle_t spi) {
 // TODO: Not sure why this doesn't work
 void lcd_info(spi_device_handle_t spi, uint8_t cmd) {
   lcd_cmd(spi, cmd);
-
   spi_transaction_t t;
   memset(&t, 0, sizeof(t));
-  t.length = 8*3;
+  t.length = 8*4;
   t.flags = SPI_TRANS_USE_RXDATA;
-  t.user = (void *)1;
+  t.user = (void *)0;
   esp_err_t ret;
-  ret = spi_device_polling_transmit(spi, &t);
+  ret = spi_device_transmit(spi, &t);
   assert(ret == ESP_OK);
+  t.user = (void *)1;
+  ret = spi_device_transmit(spi, &t);
+  assert(ret == ESP_OK);
+  printf("%x: %x %x %x %x\n", cmd, t.rx_data[0], t.rx_data[1], t.rx_data[2], t.rx_data[3]);
+}
 
-  printf("%x: %x\n", cmd, *(uint32_t*)t.rx_data);
+// Queue a list of transactions
+void lcd_write(spi_device_handle_t spi, spi_transaction_t *trans, size_t length) {
+  for (int x = 0; x < length; x++) {
+    esp_err_t ret = spi_device_queue_trans(spi, &trans[x], portMAX_DELAY);
+    ESP_ERROR_CHECK_WITHOUT_ABORT(ret);
+  }
+  spi_transaction_t *ret_trans;
+  for (int x = 0; x < length; x++) {
+    esp_err_t ret = spi_device_get_trans_result(spi, &ret_trans, portMAX_DELAY);
+    ESP_ERROR_CHECK_WITHOUT_ABORT(ret);
+  }
+}
+
+// Set the window
+void set_window(spi_device_handle_t spi, uint16_t x, uint16_t y, uint16_t w, uint16_t h) {
+  if(x > 320) return;
+  if(y > 480) return;
+
+  uint16_t x1 = fmin(320, x + w) - 1;
+  uint16_t y1 = fmin(480, y + h) - 1;
+
+  spi_transaction_t trans[4];
+  for (int i = 0; i < 4; i++) {
+    memset(&trans[i], 0, sizeof(spi_transaction_t));
+    if ((i & 1) == 0) {
+      trans[i].user = (void *)0; // set command bit
+      trans[i].length = 8;       // 8 bit command
+    } else {
+      trans[i].user = (void *)1; // set command bit to data
+      trans[i].length = 8 * 4;   // 8 bit command
+    }
+    trans[i].flags = SPI_TRANS_USE_TXDATA;
+  }
+
+  trans[0].tx_data[0] = HX8357_CASET; // Column Address Set
+  trans[1].tx_data[0] = x >> 8;       // Start Col High
+  trans[1].tx_data[1] = x & 0xff;     // Start Col Low
+  trans[1].tx_data[2] = x1 >> 8;      // End Col High
+  trans[1].tx_data[3] = x1 & 0xff;    // End Col Low
+  trans[2].tx_data[0] = HX8357_PASET; // Page address set
+  trans[3].tx_data[0] = y >> 8;       // Start page high
+  trans[3].tx_data[1] = y & 0xff;     // start page low
+  trans[3].tx_data[2] = y1 >> 8;      // end page high
+  trans[3].tx_data[3] = y1 & 0xff;    // end page low
+  lcd_write(spi, trans, 4);
+}
+
+void write_bitmap(spi_device_handle_t spi, uint8_t *data, uint16_t x,
+                  uint16_t y, uint16_t w, uint16_t h) {
+  set_window(spi, x, y, w, h);
+  spi_transaction_t trans[2] = {
+    {
+     .user = (void *)0,
+     .length = 8,
+     .tx_data = {HX8357_RAMWR},
+     .flags = SPI_TRANS_USE_TXDATA
+    },
+    {
+      .user = (void*) 1,
+      .length = w * h * 3 * 8,
+      .tx_buffer = data
+    }
+  };
+  lcd_write(spi, trans, 2);
 }
 
 void app_main() {
@@ -147,18 +223,18 @@ void app_main() {
   });
   ESP_ERROR_CHECK(ret);
   struct stat st = {0};
-  stat("/assets/font.otf", &st);
+  stat("/assets/font.ttf", &st);
   printf("font size: %li\n", st.st_size);
   uint8_t *font = malloc(st.st_size);
   int64_t start = esp_timer_get_time();
-  FILE *fd = fopen("/assets/font.otf", "rb");
+  FILE *fd = fopen("/assets/font.ttf", "rb");
   fread(font, 1, st.st_size, fd);
   fclose(fd);
   stbtt_fontinfo info;
   stbtt_InitFont(&info, font, stbtt_GetFontOffsetForIndex(font, 0));
   int64_t end = esp_timer_get_time() - start;
-  printf("Time %lld (%lld millis)\n", end, end / 1000L);
-
+  printf("Time to load fonts %lld (%lld millis)\n", end, end / 1000L);
+  heap_caps_print_heap_info(MALLOC_CAP_DMA);
   /* Print chip information */
   esp_chip_info_t chip_info;
   esp_chip_info(&chip_info);
@@ -180,9 +256,7 @@ void app_main() {
     .sclk_io_num = PIN_NUM_SCLK,
     .quadwp_io_num = -1,
     .quadhd_io_num = -1,
-    .max_transfer_sz = 320 * 3 * 40,
-    .flags = SPICOMMON_BUSFLAG_MASTER | SPICOMMON_BUSFLAG_SCLK |
-             SPICOMMON_BUSFLAG_MISO | SPICOMMON_BUSFLAG_MOSI
+    .max_transfer_sz = 320 * 3 * 480
   }, 1);
   ESP_ERROR_CHECK(ret);
 
@@ -200,18 +274,6 @@ void app_main() {
   ESP_ERROR_CHECK(ret);
   printf("It worked.\n");
 
-  /*
-    We use six transactions here.
-    CASET and PASET take two bytes each a high octet and a low octet to form a uint16_t.
-    1. CASET - which columns to write to.
-    2. CASET bytes(2)
-    3. PASET - the page adress to start and end at.
-    4. PASET bytes(2)
-    5. RAMWR - sending data
-    6. RAMWR line 480 pixels * 20 lines.
-  */
-  spi_transaction_t trans[6];
-
   size_t lines = 40;
   uint8_t *line = heap_caps_malloc(320 * lines * 3, MALLOC_CAP_DMA);
   for (int i = 0; i < 320 * lines * 3; i += 3) {
@@ -220,115 +282,77 @@ void app_main() {
     line[i + 2] = 0x00;
   }
 
-  for (int i = 0; i < 6; i++) {
-    memset(&trans[i], 0, sizeof(spi_transaction_t));
-    if ((i & 1) == 0) {
-      trans[i].user = (void *)0; // set command bit
-      trans[i].length = 8;       // 8 bit command
-    } else {
-      trans[i].user = (void *)1; // set command bit
-      trans[i].length = 8 * 4;   // 8 bit command
-    }
-    trans[i].flags = SPI_TRANS_USE_TXDATA; // we use data for most of this.
-  }
-
   start = esp_timer_get_time();
   for (int y = 0; y < 480; y += lines) {
-    trans[0].tx_data[0] = HX8357_CASET;       // Column Address Set
-    trans[1].tx_data[0] = 0;                  // Start Col High
-    trans[1].tx_data[1] = 0;                  // Start Col Low
-    trans[1].tx_data[2] = 320 >> 8;           // End Col High
-    trans[1].tx_data[3] = 320 & 0xff;         // End Col Low
-    trans[2].tx_data[0] = HX8357_PASET;       // Page address set
-    trans[3].tx_data[0] = y >> 8;             // Start page high
-    trans[3].tx_data[1] = y & 0xff;           // start page low
-    trans[3].tx_data[2] = (y + lines) >> 8;   // end page high
-    trans[3].tx_data[3] = (y + lines) & 0xff; // end page low
-    trans[4].tx_data[0] = HX8357_RAMWR;       // memory write
-    trans[5].tx_buffer = line;                // finally send the line data
-    trans[5].length = 320 * lines * 3 * 8;    // Data length, in bits
-    trans[5].flags = 0; // undo SPI_TRANS_USE_TXDATA
-                        // flag
-    for (int x = 0; x < 6; x++) {
-      ret = spi_device_queue_trans(lcd, &trans[x], portMAX_DELAY);
-      ESP_ERROR_CHECK_WITHOUT_ABORT(ret);
-    }
-    spi_transaction_t *spi;
-    for (int x = 0; x < 6; x++) {
-      ret = spi_device_get_trans_result(lcd, &spi, portMAX_DELAY);
-      ESP_ERROR_CHECK_WITHOUT_ABORT(ret);
-    }
+    write_bitmap(lcd, line, 0, y, 320, lines);
   }
   free(line);
   end = esp_timer_get_time() - start;
-  printf("Time %lld (%lld millis)\n", end, end / 1000L);
+  printf("Time to blank %lld (%lld millis)\n", end, end / 1000L);
 
-  start = esp_timer_get_time();
   int ascent = 0;
-  float scale = stbtt_ScaleForPixelHeight(&info, 40);
+  float scale = stbtt_ScaleForPixelHeight(&info, 50);
   stbtt_GetFontVMetrics(&info, &ascent, 0, 0);
-  int baseline = ascent * scale;
-  uint8_t screen[40][40];
-  memset(screen, 0, sizeof(uint8_t));
-  int x0, y0, x1, y1;
-  const char *hello = "H";
-  stbtt_GetCodepointBitmapBoxSubpixel(
-    &info, hello[0], scale, scale,
-    0, 0, &x0, &y0, &x1, &y1
-  );
+  int baseline = (int) (ascent * scale);
+  const char *hello = "Phone";
+  size_t w = 0, h = 0;
+  start = esp_timer_get_time();
+  // TODO: this repeats work let's fix that.
+  for (int i = 0; i < 5; i++) {
+    int advance, lsb, x0, y0, x1, y1;
+    stbtt_GetCodepointHMetrics(&info, hello[i], &advance, &lsb);
+    float shift = w - (float) floor(w);
+    stbtt_GetCodepointBitmapBoxSubpixel(&info, hello[i], scale, scale, shift, 0, &x0, &y0, &x1, &y1);
+    h = fmax(h, baseline + (y1 - y0));
+    w += (advance * scale);
+    if (hello[i + 1])
+      w += scale*stbtt_GetCodepointKernAdvance(&info, hello[i], hello[i+1]);
+  }
 
-  stbtt_MakeCodepointBitmapSubpixel(
-    &info, &screen[0][0],
-    40, 40, 40, scale, scale, 0, 0, hello[0]
-  );
-  uint8_t *pixels = heap_caps_malloc(40 * 40 * 3, MALLOC_CAP_DMA);
-  for (int y = 0; y < 40; y++) {
-    for (int x = 0; x < 40 * 3; x += 3) {
-      pixels[y + x] = screen[y][x / 3];
-      pixels[y + x + 1] = screen[y][x / 3];
-      pixels[y + x + 2] = screen[y][x / 3];
+  uint8_t *pixels = heap_caps_calloc(w * h * 3, sizeof(uint8_t), MALLOC_CAP_DMA);
+  int xoff = 0;
+  for (int j = 0; j < 5; j++) {
+    int advance, lsb, x0, y0, x1, y1;
+    stbtt_GetCodepointHMetrics(&info, hello[j], &advance, &lsb);
+    float shift = xoff - (float) floor(xoff);
+    stbtt_GetCodepointBitmapBoxSubpixel(&info, hello[j], scale, scale, shift, 0, &x0, &y0, &x1, &y1);
+
+    int wb, hb, xb, yb;
+    start = esp_timer_get_time();
+    uint8_t *screen = stbtt_GetCodepointBitmapSubpixel(
+      &info, scale, scale, 0, 0, hello[j], &wb, &hb, &xb, &yb
+    );
+
+    for (int y = 0; y < hb / 2; y++) {
+      for (int x = 0; x < wb; x++) {
+        float alpha = (float) screen[y * wb + x] / 255.0;
+        float blend =  alpha * (float) screen[y * wb + x];
+        for (int c = 0; c < 3; c++) {
+          size_t off = (y + baseline + y0) * w * 3 + (xoff + x0 + x) * 3 + c;
+          pixels[off] = (uint8_t) fmin(255, blend + (1 - alpha) * (float) pixels[off]);
+        }
+      }
     }
+    free(screen);
+    xoff += (advance * scale);
+    if (hello[j + 1])
+      xoff += scale*stbtt_GetCodepointKernAdvance(&info, hello[j], hello[j+1]);
   }
 
-  trans[0].tx_data[0] = HX8357_CASET;       // Column Address Set
-  trans[1].tx_data[0] = (320 / 2 - 20) >> 8;            // Start Col High
-  trans[1].tx_data[1] = (320 / 2 - 20) & 0xff;         // Start Col Low
-  trans[1].tx_data[2] = (320 / 2 + 20) >> 8;           // End Col High
-  trans[1].tx_data[3] = (320 / 2 + 20) & 0xff;         // End Col Low
-  trans[2].tx_data[0] = HX8357_PASET;       // Page address set
-  trans[3].tx_data[0] = (480 / 2 - 20) >> 8;             // Start page high
-  trans[3].tx_data[1] = (480 / 2 - 20) & 0xff;           // start page low
-  trans[3].tx_data[2] = (480 / 2 + 20) >> 8;   // end page high
-  trans[3].tx_data[3] = (480 / 2 + 20) & 0xff; // end page low
-  trans[4].tx_data[0] = HX8357_RAMWR;       // memory write
-  trans[5].tx_buffer = pixels;                // finally send the line data
-  trans[5].length = 40 * 40 * 3 * 8;    // Data length, in bits
-  trans[5].flags = 0; // undo SPI_TRANS_USE_TXDATA
-                        // flag
-
-  for (int x = 0; x < 6; x++) {
-    ret = spi_device_queue_trans(lcd, &trans[x], portMAX_DELAY);
-    ESP_ERROR_CHECK_WITHOUT_ABORT(ret);
-  }
-  spi_transaction_t *spi;
-  for (int x = 0; x < 6; x++) {
-    ret = spi_device_get_trans_result(lcd, &spi, portMAX_DELAY);
-    ESP_ERROR_CHECK_WITHOUT_ABORT(ret);
-  }
   end = esp_timer_get_time() - start;
-  printf("Rendered in %lld (%lld millis)\n", end, end / 1000);
-  for (int j=0; j < 20; ++j) {
-    for (int i=0; i < 20; ++i)
-      putchar(" .:ioVM@"[screen[j][i]>>5]);
-    putchar('\n');
+  printf("layout in %lld (%lld millis)\n", end, end / 1000);
+  uint8_t *mask = heap_caps_calloc(w * 3, sizeof(uint8_t), MALLOC_CAP_DMA);
+  for (int y_int = 0; y_int < 480 - h; y_int += 1) {
+    start = esp_timer_get_time();
+    if (y_int > 1) write_bitmap(lcd, mask, 320 / 2 - w / 2, y_int - 1, w, 1);
+    write_bitmap(lcd, pixels, 320 / 2 - w / 2, y_int, w, h);
+    end = esp_timer_get_time() - start;
+    if(y_int == 10) printf("render in %lld (%lld millis)\n", end, end / 1000);
   }
+  free(mask);
   free(pixels);
   free(font);
-
-  for (int i = 10; i >= 0; i--) {
-    printf("Restarting in %d seconds...\n", i);
-    vTaskDelay(1000 / portTICK_PERIOD_MS);
-  }
+  while(1);
   printf("Restarting now.\n");
   fflush(stdout);
   esp_vfs_spiffs_unregister(NULL);

@@ -6,4 +6,5 @@
 PROJECT_NAME := phone
 
 include $(IDF_PATH)/make/project.mk
-$(eval $(call spiffs_create_partition_image,storage,assets,FLASH_IN_PROJECT))
+SPIFFS_IMAGE_FLASH_IN_PROJECT := 1
+$(eval $(call spiffs_create_partition_image,storage,assets))
