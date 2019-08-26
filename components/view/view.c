@@ -3,6 +3,14 @@
 #include <string.h>
 #include "view.h"
 
+point_t point_new(float x, float y){
+  return (point_t){
+    .x = x,
+    .y = y,
+    .w = 1
+  };
+};
+
 affine_t* affine_new(float rx, float sx, float tx,
                     float sy, float ry, float ty) {
   affine_t *aff = malloc(sizeof(affine_t));
@@ -18,7 +26,6 @@ void affine_free(affine_t *A) {
 
 void affine_multiply(affine_t *A, affine_t *B) {
   float res[9];
-  memcpy(res, A->inner, sizeof(res));
   float *a = A->inner;
   float *b = B->inner;
   res[0] = a[0] * b[0] + a[1] * b[3] + a[2] * b[6];
@@ -48,6 +55,19 @@ void affine_translate(affine_t *A, float x, float y) {
         0, 0, 1
       }
     });
+}
+
+point_t affine_project(point_t p, affine_t *A) {
+   float *a = A->inner;
+   point_t ret =  {
+     .x = a[0] * p.x + a[1] * p.y + a[2],
+     .y = a[3] * p.x + a[4] * p.y + a[5],
+     .w = a[5] * p.x + a[7] * p.y + a[8]
+   };
+   ret.x /= ret.w;
+   ret.y /= ret.w;
+   ret.w /= ret.w;
+   return ret;
 }
 
 void affine_rotate(affine_t *A, float degrees) {
