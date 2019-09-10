@@ -11,6 +11,20 @@ point_t point_new(float x, float y){
   };
 };
 
+point_t affine_project(point_t p, affine_t *A) {
+   float *a = A->inner;
+   point_t ret =  {
+     .x = a[0] * p.x + a[1] * p.y + a[2],
+     .y = a[3] * p.x + a[4] * p.y + a[5],
+     .w = a[5] * p.x + a[6] * p.y + a[7]
+   };
+   float d = p.x * a[5] + p.y * a[6] + p.w * a[7];
+   ret.x /= d;
+   ret.y /= d;
+   ret.w /= d;
+   return ret;
+}
+
 affine_t* affine_new(float rx, float sx, float tx,
                     float sy, float ry, float ty) {
   affine_t *aff = malloc(sizeof(affine_t));
@@ -57,18 +71,7 @@ void affine_translate(affine_t *A, float x, float y) {
     });
 }
 
-point_t affine_project(point_t p, affine_t *A) {
-   float *a = A->inner;
-   point_t ret =  {
-     .x = a[0] * p.x + a[1] * p.y + a[2],
-     .y = a[3] * p.x + a[4] * p.y + a[5],
-     .w = a[5] * p.x + a[7] * p.y + a[8]
-   };
-   ret.x /= ret.w;
-   ret.y /= ret.w;
-   ret.w /= ret.w;
-   return ret;
-}
+
 
 void affine_rotate(affine_t *A, float degrees) {
   affine_multiply(A, &(affine_t){
